@@ -1,0 +1,45 @@
+name: Garmin Sync
+
+on:
+  schedule:
+    # 05:25 UTC = 07:25 Sommerzeit / 06:25 Winterzeit.
+    # Nach dem Whoop-Lauf, damit beide Quellen morgens frisch sind.
+    - cron: "25 5 * * *"
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "Startdatum YYYY-MM-DD (leer = letzte 14 Tage)"
+        required: false
+        default: ""
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Abhaengigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Garmin-Token wiederherstellen
+        run: |
+          echo "${{ secrets.GARMIN_TOKENS }}" | base64 -d | tar xzf - -C "$HOME"
+          test -d "$HOME/.garth" || { echo "Token-Ordner fehlt"; exit 1; }
+
+      - name: Synchronisieren
+        env:
+          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+        run: |
+          if [ -n "${{ github.event.inputs.since }}" ]; then
+            python garmin_sync.py --since "${{ github.event.inputs.since }}"
+          else
+            python garmin_sync.py --days 14
+          fi
