@@ -13,7 +13,8 @@ Drive-Ordner "Health".
     fit/<id>.fit                   Originaldatei, unveraendert
 
 Umgebung:
-    GOOGLE_SERVICE_ACCOUNT   JSON-Schluessel des Dienstkontos (als Text)
+    GOOGLE_OAUTH_TOKEN       JSON mit client_id, client_secret, refresh_token
+                             (einmalig erzeugt mit google_oauth_setup.py)
     DRIVE_FOLDER_ID          ID des Ordners "Health"
     ~/.garth                 Garmin-Anmeldetoken (aus dem Secret entpackt)
 
@@ -37,6 +38,7 @@ from pathlib import Path
 import fitparse
 from garminconnect import Garmin
 from google.oauth2 import service_account
+from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
@@ -94,14 +96,40 @@ SET_FIELDS = [
 # Google Drive
 # ---------------------------------------------------------------------------
 
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+
 class Drive:
+    """
+    Schreibt in den Drive-Ordner des Nutzers.
+
+    Bevorzugt OAuth im Namen des eigenen Google-Kontos (GOOGLE_OAUTH_TOKEN).
+    Ein Dienstkonto funktioniert nur zum Lesen: neu erzeugte Dateien wuerden dem
+    Dienstkonto gehoeren, und das hat keinen eigenen Speicherplatz — Google
+    antwortet dann mit storageQuotaExceeded.
+    """
+
     def __init__(self, folder_id: str):
-        raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT", "")
-        if not raw:
-            sys.exit("GOOGLE_SERVICE_ACCOUNT fehlt.")
-        creds = service_account.Credentials.from_service_account_info(
-            json.loads(raw), scopes=["https://www.googleapis.com/auth/drive"]
-        )
+        token = os.environ.get("GOOGLE_OAUTH_TOKEN", "")
+        if token:
+            data = json.loads(token)
+            creds = UserCredentials(
+                token=None,
+                refresh_token=data["refresh_token"],
+                client_id=data["client_id"],
+                client_secret=data["client_secret"],
+                token_uri="https://oauth2.googleapis.com/token",
+                scopes=SCOPES,
+            )
+        else:
+            raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT", "")
+            if not raw:
+                sys.exit("GOOGLE_OAUTH_TOKEN fehlt (oder GOOGLE_SERVICE_ACCOUNT).")
+            print("Warnung: Dienstkonto kann keine Dateien anlegen — "
+                  "GOOGLE_OAUTH_TOKEN verwenden.")
+            creds = service_account.Credentials.from_service_account_info(
+                json.loads(raw), scopes=SCOPES
+            )
         self.api = build("drive", "v3", credentials=creds, cache_discovery=False)
         self.folder_id = folder_id
         self._fit_folder = None
@@ -203,10 +231,19 @@ def hr_seconds(fit: fitparse.FitFile) -> list[int]:
     return buckets
 
 
-def vo2max_of(fit: fitparse.FitFile):
-    data = first(fit, VO2MAX_MESSAGE)
-    value = data.get(VO2MAX_FIELD)
-    return value if isinstance(value, (int, float)) and 20 < value < 90 else None
+def vo2max_of(fit: fitparse.FitFile, session: dict):
+    """
+    VO2max steht in einer undokumentierten Garmin-Nachricht. Dasselbe Feld ist
+    bei Einheiten ohne Leistungsmessung mit etwas anderem belegt (Krafttraining
+    lieferte dort 26, eine Ausfahrt ohne Powermeter 27). Garmin rechnet den
+    Radwert ohnehin nur mit Leistungsdaten — deshalb beides zur Bedingung.
+    """
+    if not session.get("avg_power"):
+        return None
+    if session.get("sport") not in ("cycling", "running"):
+        return None
+    value = first(fit, VO2MAX_MESSAGE).get(VO2MAX_FIELD)
+    return value if isinstance(value, (int, float)) and 35 <= value <= 75 else None
 
 
 def parse_fit(blob: bytes, activity_id: str, name: str):
@@ -245,7 +282,7 @@ def parse_fit(blob: bytes, activity_id: str, name: str):
         "work_kj": rnd((session.get("total_work") or 0) / 1000, 0),
         "training_effect_aerobic": rnd(session.get("total_training_effect"), 1),
         "training_effect_anaerobic": rnd(session.get("total_anaerobic_training_effect"), 1),
-        "vo2max": vo2max_of(fit),
+        "vo2max": vo2max_of(fit, session),
         "setting_hr_max": settings.get("max_heart_rate") or profile.get("default_max_heart_rate"),
         "setting_resting_hr": settings.get("resting_heart_rate") or profile.get("resting_heart_rate"),
         "setting_ftp": settings.get("functional_threshold_power"),
@@ -341,6 +378,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Garmin-Aktivitaeten nach Drive")
     parser.add_argument("--days", type=int, default=14)
     parser.add_argument("--since", help="Startdatum YYYY-MM-DD")
+    parser.add_argument("--force", action="store_true",
+                        help="Bereits erfasste Einheiten neu einlesen und ueberschreiben")
     args = parser.parse_args()
 
     folder_id = os.environ.get("DRIVE_FOLDER_ID", "")
@@ -359,10 +398,13 @@ def main() -> None:
 
     # Bereits verarbeitete Einheiten aus den vorhandenen CSVs lesen.
     known = set()
-    for year in {start.year, end.year}:
-        text = drive.read_text(f"garmin_activities_{year}.csv")
-        for row in csv.DictReader(io.StringIO(text)) if text else []:
-            known.add(str(row.get("activity_id")))
+    if not args.force:
+        for year in {start.year, end.year}:
+            text = drive.read_text(f"garmin_activities_{year}.csv")
+            for row in csv.DictReader(io.StringIO(text)) if text else []:
+                known.add(str(row.get("activity_id")))
+    else:
+        print("--force: alle Einheiten im Zeitraum werden neu eingelesen")
 
     listed = api.get_activities_by_date(start.isoformat(), end.isoformat())
     print(f"{len(listed)} Aktivitaeten im Zeitraum, {len(known)} davon bereits erfasst")
@@ -397,8 +439,11 @@ def main() -> None:
         activities.append(activity)
         laps.extend(activity_laps)
         sets.extend(activity_sets)
-        drive.write(f"{activity_id}.fit", fit_bytes,
-                    "application/octet-stream", drive.fit_folder())
+        try:
+            drive.write(f"{activity_id}.fit", fit_bytes,
+                        "application/octet-stream", drive.fit_folder())
+        except Exception as error:  # noqa: BLE001
+            print(f"    Archiv-Upload fehlgeschlagen: {error}")
 
     if not activities:
         print("Nichts Neues.")
