@@ -1,6 +1,10 @@
-garminconnect>=0.2.19
-garth>=0.4.46
-fitparse>=1.2.0
+# Versionen bewusst festgenagelt: mit genau dieser Kombination laeuft der
+# Token-Login (garth.save lokal -> garth.resume im Runner). Neuere
+# garminconnect-Versionen erwarten ein anderes Token-Format und fallen dann
+# auf Benutzername/Passwort zurueck.
+garminconnect==0.2.8
+garth==0.4.47
+fitparse==1.2.0
 google-api-python-client>=2.120.0
 google-auth>=2.28.0
 google-auth-oauthlib>=1.2.0
