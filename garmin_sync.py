@@ -391,8 +391,22 @@ def main() -> None:
     end = date.today()
     print(f"Zeitraum: {start} bis {end}")
 
+    token_dir = Path.home() / ".garth"
+    found = sorted(p.name for p in token_dir.glob("*")) if token_dir.is_dir() else []
+    print(f"Token-Ordner {token_dir}: {found or 'LEER'}")
+    if not found:
+        sys.exit("Keine Garmin-Tokens gefunden — Secret GARMIN_TOKENS pruefen.")
+
     api = Garmin()
-    api.login(str(Path.home() / ".garth"))
+    try:
+        api.login(str(token_dir))
+    except Exception as error:  # noqa: BLE001
+        sys.exit(
+            f"Garmin-Login fehlgeschlagen: {error}\n"
+            "Meist ein Versionskonflikt: die Tokens wurden mit einer anderen "
+            "garth-Version erzeugt. Lokal 'garth.save' erneut ausfuehren und das "
+            "Secret GARMIN_TOKENS neu setzen."
+        )
 
     drive = Drive(folder_id)
 
