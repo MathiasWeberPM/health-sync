@@ -28,25 +28,9 @@ jobs:
       - name: Abhaengigkeiten installieren
         run: pip install -r requirements.txt
 
-      - name: Garmin-Token wiederherstellen
-        run: |
-          printf '%s' "${{ secrets.GARMIN_TOKENS }}" | tr -d '\n' | base64 -d | tar xzf - -C "$HOME"
-          test -d "$HOME/.garth" || { echo "Token-Ordner fehlt"; exit 1; }
-          # Jede Token-Datei muss gueltiges JSON enthalten. Ist eine leer oder
-          # abgeschnitten, liegt es am Secret und nicht am Garmin-Konto.
-          for f in "$HOME"/.garth/*.json; do
-            size=$(wc -c < "$f")
-            echo "$(basename "$f"): ${size} Bytes"
-            if [ "$size" -lt 10 ]; then
-              echo "FEHLER: $f ist leer oder abgeschnitten - Secret GARMIN_TOKENS neu setzen."
-              exit 1
-            fi
-            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" \
-              || { echo "FEHLER: $f ist kein gueltiges JSON - Secret neu setzen."; exit 1; }
-          done
-
       - name: Synchronisieren
         env:
+          GARMIN_TOKENS_JSON: ${{ secrets.GARMIN_TOKENS_JSON }}
           GOOGLE_OAUTH_TOKEN: ${{ secrets.GOOGLE_OAUTH_TOKEN }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
         run: |
