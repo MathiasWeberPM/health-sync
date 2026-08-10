@@ -16,7 +16,8 @@ Umgebung:
     GOOGLE_OAUTH_TOKEN       JSON mit client_id, client_secret, refresh_token
                              (einmalig erzeugt mit google_oauth_setup.py)
     DRIVE_FOLDER_ID          ID des Ordners "Health"
-    ~/.garth                 Garmin-Anmeldetoken (aus dem Secret entpackt)
+    GARMIN_TOKENS_JSON       JSON mit dem Inhalt der Garmin-Tokendateien
+                             (lokal erzeugt, siehe README-Befehl)
 
 Lokal testen:
     python garmin_sync.py --days 7
@@ -374,6 +375,36 @@ def merge_csv(drive: Drive, name: str, fields: list, rows: list, key) -> int:
 
 # ---------------------------------------------------------------------------
 
+def restore_tokens() -> Path:
+    """
+    Schreibt die Garmin-Tokens aus GARMIN_TOKENS_JSON nach ~/.garth.
+
+    Frueher lief das ueber tar + base64 im Workflow. Das ist an der Shell
+    zerbrochen: die Dateien landeten zwar am richtigen Ort, aber mit
+    abgeschnittenem Inhalt, und garth scheiterte erst spaeter am JSON.
+    Jetzt liegt ein einziges JSON-Objekt im Secret, Python schreibt die
+    Dateien selbst. Ohne die Variable bleibt ein vorhandener ~/.garth
+    unangetastet - so laeuft es lokal weiter wie bisher.
+    """
+    token_dir = Path.home() / ".garth"
+    raw = os.environ.get("GARMIN_TOKENS_JSON", "").strip()
+    if not raw:
+        return token_dir
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as error:
+        sys.exit(f"GARMIN_TOKENS_JSON ist kein gueltiges JSON: {error}")
+
+    token_dir.mkdir(parents=True, exist_ok=True)
+    for name, content in payload.items():
+        target = token_dir / name
+        target.write_text(json.dumps(content), encoding="utf-8")
+        target.chmod(0o600)
+        print(f"  {name}: {target.stat().st_size} Bytes geschrieben")
+    return token_dir
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Garmin-Aktivitaeten nach Drive")
     parser.add_argument("--days", type=int, default=14)
@@ -391,7 +422,7 @@ def main() -> None:
     end = date.today()
     print(f"Zeitraum: {start} bis {end}")
 
-    token_dir = Path.home() / ".garth"
+    token_dir = restore_tokens()
     found = sorted(p.name for p in token_dir.glob("*")) if token_dir.is_dir() else []
     print(f"Token-Ordner {token_dir}: {found or 'LEER'}")
     if not found:
