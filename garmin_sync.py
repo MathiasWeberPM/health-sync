@@ -76,6 +76,7 @@ ACTIVITY_FIELDS = [
     "intensity_factor", "tss", "avg_cadence",
     "calories", "work_kj",
     "training_effect_aerobic", "training_effect_anaerobic", "vo2max",
+    "power_gap_pct",
     "setting_hr_max", "setting_resting_hr", "setting_ftp",
     "hr_z1_s", "hr_z2_s", "hr_z3_s", "hr_z4_s", "hr_z5_s",
     "fit_file",
@@ -232,16 +233,47 @@ def hr_seconds(fit: fitparse.FitFile) -> list[int]:
     return buckets
 
 
-def vo2max_of(fit: fitparse.FitFile, session: dict):
+def power_gap_pct(fit: fitparse.FitFile) -> float | None:
+    """
+    Anteil der Aufzeichnung mit Leistung 0 W bei gleichzeitig aktivem Puls -
+    ein echter Trainingsstopp zeigt sich meist auch im Puls, ein reiner
+    ANT+-Aussetzer nicht. Hoher Wert heisst: avg_power/VO2max/Trainingseffekt
+    dieser Einheit sind durch Funkaussetzer nach unten verzerrt und sollten
+    nicht als Fitness-Ruckgang gelesen werden - Strava/Zwift-Leistungsdaten
+    sind an diesen Tagen die verlaesslichere Quelle.
+    """
+    total = 0
+    dropped = 0
+    for message in fit.get_messages("record"):
+        power = hr = None
+        for field in message:
+            if field.name == "power":
+                power = field.value
+            elif field.name == "heart_rate":
+                hr = field.value
+        if power is None or hr is None:
+            continue
+        total += 1
+        if power == 0 and hr > 100:
+            dropped += 1
+    return round(100 * dropped / total, 1) if total else None
+
+
+def vo2max_of(fit: fitparse.FitFile, session: dict, gap_pct: float | None):
     """
     VO2max steht in einer undokumentierten Garmin-Nachricht. Dasselbe Feld ist
     bei Einheiten ohne Leistungsmessung mit etwas anderem belegt (Krafttraining
     lieferte dort 26, eine Ausfahrt ohne Powermeter 27). Garmin rechnet den
     Radwert ohnehin nur mit Leistungsdaten — deshalb beides zur Bedingung.
+    Bei spuerbaren Funkaussetzern (siehe power_gap_pct) rechnet Garmin selbst
+    mit den beschaedigten Werten; der Wert wird dann verworfen statt einen
+    falschen Fitness-Ruckgang vorzutaeuschen.
     """
     if not session.get("avg_power"):
         return None
     if session.get("sport") not in ("cycling", "running"):
+        return None
+    if gap_pct is not None and gap_pct >= 2.0:
         return None
     value = first(fit, VO2MAX_MESSAGE).get(VO2MAX_FIELD)
     return value if isinstance(value, (int, float)) and 35 <= value <= 75 else None
@@ -259,6 +291,7 @@ def parse_fit(blob: bytes, activity_id: str, name: str):
     sport = session.get("sport") or ""
 
     zones = hr_seconds(fit)
+    gap_pct = power_gap_pct(fit)
     duration = session.get("total_timer_time") or 0
 
     activity = {
@@ -283,7 +316,8 @@ def parse_fit(blob: bytes, activity_id: str, name: str):
         "work_kj": rnd((session.get("total_work") or 0) / 1000, 0),
         "training_effect_aerobic": rnd(session.get("total_training_effect"), 1),
         "training_effect_anaerobic": rnd(session.get("total_anaerobic_training_effect"), 1),
-        "vo2max": vo2max_of(fit, session),
+        "vo2max": vo2max_of(fit, session, gap_pct),
+        "power_gap_pct": gap_pct,
         "setting_hr_max": settings.get("max_heart_rate") or profile.get("default_max_heart_rate"),
         "setting_resting_hr": settings.get("resting_heart_rate") or profile.get("resting_heart_rate"),
         "setting_ftp": settings.get("functional_threshold_power"),
@@ -434,9 +468,13 @@ def main() -> None:
     except Exception as error:  # noqa: BLE001
         sys.exit(
             f"Garmin-Login fehlgeschlagen: {error}\n"
-            "Meist ein Versionskonflikt: die Tokens wurden mit einer anderen "
-            "garth-Version erzeugt. Lokal 'garth.save' erneut ausfuehren und das "
-            "Secret GARMIN_TOKENS neu setzen."
+            "Wenn die Tokendateien oben mit plausibler Groesse geschrieben wurden, "
+            "liegt es nicht am Secret: Garmin sitzt hinter Cloudflare und weist "
+            "Anfragen aus Rechenzentren ab. Ein leerer Antwortkoerper aeussert sich "
+            "als JSON-Fehler. Dieses Skript braucht eine Wohnadresse im Netz - "
+            "lokal oder auf einem Geraet zu Hause ausfuehren.\n"
+            "WICHTIG: nicht wiederholt neu starten. Mehrere Fehlversuche loesen "
+            "eine kontobezogene Sperre aus, die 24 bis 48 Stunden anhaelt."
         )
 
     drive = Drive(folder_id)
