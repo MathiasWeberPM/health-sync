@@ -77,6 +77,9 @@ ACTIVITY_FIELDS = [
     "calories", "work_kj",
     "training_effect_aerobic", "training_effect_anaerobic", "vo2max",
     "power_gap_pct",
+    "vertical_oscillation_cm", "ground_contact_time_ms",
+    "ground_contact_balance_pct", "step_length_m", "vertical_ratio_pct",
+    "running_cadence_spm", "step_speed_loss_cms", "step_speed_loss_pct",
     "setting_hr_max", "setting_resting_hr", "setting_ftp",
     "hr_z1_s", "hr_z2_s", "hr_z3_s", "hr_z4_s", "hr_z5_s",
     "fit_file",
@@ -318,6 +321,40 @@ def parse_fit(blob: bytes, activity_id: str, name: str):
         "training_effect_anaerobic": rnd(session.get("total_anaerobic_training_effect"), 1),
         "vo2max": vo2max_of(fit, session, gap_pct),
         "power_gap_pct": gap_pct,
+        # Laufdynamik: dokumentierte FIT-Standardfelder (nicht wie VO2max
+        # ein reverse-engineertes Feld), kommen vom HRM-600 bzw. jedem
+        # kompatiblen Sensor. fitparse skaliert sie automatisch in die
+        # angezeigte Einheit (cm, ms, m, %) - keine manuelle Umrechnung
+        # noetig. Nur bei Laufeinheiten belegt.
+        # Laufdynamik vom HRM-600: dokumentierte FIT-Standardfelder, an einer
+        # echten Datei bestaetigt (12.09.2026). avg_vertical_oscillation und
+        # avg_step_length kommen in mm - hier auf cm/m umgerechnet, damit sie
+        # den Werten in der Garmin-App entsprechen (75.0 mm -> 7.5 cm,
+        # 1064.8 mm -> 1.06 m). avg_stance_time (ms) und avg_vertical_ratio (%)
+        # sind bereits in der angezeigten Einheit. Nur bei Laufeinheiten belegt.
+        "vertical_oscillation_cm": rnd((session.get("avg_vertical_oscillation") or 0) / 10, 1)
+            if session.get("avg_vertical_oscillation") else None,
+        "ground_contact_time_ms": rnd(session.get("avg_stance_time"), 0),
+        "ground_contact_balance_pct": rnd(session.get("avg_stance_time_balance"), 1),
+        "step_length_m": rnd((session.get("avg_step_length") or 0) / 1000, 2)
+            if session.get("avg_step_length") else None,
+        "vertical_ratio_pct": rnd(session.get("avg_vertical_ratio"), 1),
+        "running_cadence_spm": session.get("avg_running_cadence"),
+        # Step Speed Loss ("Geschwindigkeitsverlust bei Bodenkontakt"): neue
+        # HRM-600-Metrik (Garmin Running Economy, seit Mai 2025), noch nicht
+        # in der fitparse-Feldtabelle benannt - taucht als unknown_222/223
+        # in der Session-Nachricht auf. Anders als bei VO2max nicht nur
+        # geraten: an dieser Datei gegen die App-Anzeige exakt bestaetigt
+        # (1908 -> 19,08 cm/s, 642 -> 6,42 % - beide auf die zweite
+        # Nachkommastelle deckungsgleich mit dem Screenshot). Bleibt trotzdem
+        # ein undokumentiertes Feld - Plausibilitaetsgrenze als Absicherung,
+        # falls Garmin die Feldbelegung in einer FIT-Version aendert.
+        "step_speed_loss_cms": rnd(session.get("unknown_222", 0) / 100, 2)
+            if session.get("unknown_222") and 0 < session.get("unknown_222") < 10000
+            else None,
+        "step_speed_loss_pct": rnd(session.get("unknown_223", 0) / 100, 2)
+            if session.get("unknown_223") and 0 < session.get("unknown_223") < 3000
+            else None,
         "setting_hr_max": settings.get("max_heart_rate") or profile.get("default_max_heart_rate"),
         "setting_resting_hr": settings.get("resting_heart_rate") or profile.get("resting_heart_rate"),
         "setting_ftp": settings.get("functional_threshold_power"),
