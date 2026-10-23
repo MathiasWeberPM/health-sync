@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Garmin Connect -> Google Drive
-==============================
+Garmin Connect -> Google Drive  (offizielle Garmin Personal API)
+================================================================
 
-Laeuft taeglich als GitHub Action. Holt neue Aktivitaeten aus Garmin Connect,
+Holt neue Aktivitaeten ueber die offizielle Garmin Connect Personal API,
 liest die FIT-Dateien aus und schreibt drei CSVs plus ein Rohdatenarchiv in den
 Drive-Ordner "Health".
 
@@ -16,8 +16,9 @@ Umgebung:
     GOOGLE_OAUTH_TOKEN       JSON mit client_id, client_secret, refresh_token
                              (einmalig erzeugt mit google_oauth_setup.py)
     DRIVE_FOLDER_ID          ID des Ordners "Health"
-    GARMIN_TOKENS_JSON       JSON mit dem Inhalt der Garmin-Tokendateien
-                             (lokal erzeugt, siehe README-Befehl)
+    GARMIN_PERSONAL_API_KEY  Personal API Key (alternativ Datei
+                             ~/.config/garmin/connect-personal-api-key).
+                             Gueltig bis 21.10.2027, dann neu erzeugen.
 
 Lokal testen:
     python garmin_sync.py --days 7
@@ -37,7 +38,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import fitparse
-from garminconnect import Garmin
+import requests
 from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
@@ -446,35 +447,58 @@ def merge_csv(drive: Drive, name: str, fields: list, rows: list, key) -> int:
 
 # ---------------------------------------------------------------------------
 
-def restore_tokens() -> Path:
-    """
-    Schreibt die Garmin-Tokens aus GARMIN_TOKENS_JSON nach ~/.garth.
+class GarminPersonal:
+    """Minimaler Client fuer die offizielle Garmin Connect Personal API."""
 
-    Frueher lief das ueber tar + base64 im Workflow. Das ist an der Shell
-    zerbrochen: die Dateien landeten zwar am richtigen Ort, aber mit
-    abgeschnittenem Inhalt, und garth scheiterte erst spaeter am JSON.
-    Jetzt liegt ein einziges JSON-Objekt im Secret, Python schreibt die
-    Dateien selbst. Ohne die Variable bleibt ein vorhandener ~/.garth
-    unangetastet - so laeuft es lokal weiter wie bisher.
-    """
-    token_dir = Path.home() / ".garth"
-    raw = os.environ.get("GARMIN_TOKENS_JSON", "").strip()
-    if not raw:
-        return token_dir
+    BASE = os.environ.get("GARMIN_PERSONAL_API_BASE_URL",
+                          "https://personal.connectapi.garmin.com")
+    TOKEN_PATH = "/personalapitoken-service/personal-api/personal-api-key/token"
+    KEY_FILE = Path("~/.config/garmin/connect-personal-api-key").expanduser()
 
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as error:
-        sys.exit(f"GARMIN_TOKENS_JSON ist kein gueltiges JSON: {error}")
+    def __init__(self) -> None:
+        key = os.environ.get("GARMIN_PERSONAL_API_KEY", "").strip()
+        if not key and self.KEY_FILE.exists():
+            key = self.KEY_FILE.read_text(encoding="utf-8").strip()
+        if not key:
+            sys.exit("Kein Garmin Personal API Key (GARMIN_PERSONAL_API_KEY "
+                     f"oder {self.KEY_FILE}).")
+        resp = requests.post(self.BASE + self.TOKEN_PATH, timeout=30,
+                             headers={"Accept": "*/*", "Authorization": f"ApiKey {key}"})
+        if resp.status_code != 200:
+            sys.exit(f"Garmin-Token fehlgeschlagen: HTTP {resp.status_code}. "
+                     "Key abgelaufen oder widerrufen? Neu erzeugen unter "
+                     "developer.garmin.com (Personal API).")
+        token = resp.text.strip().strip('"')
+        self.session = requests.Session()
+        self.session.headers.update({"Authorization": f"Bearer {token}",
+                                     "Accept": "application/json"})
 
-    token_dir.mkdir(parents=True, exist_ok=True)
-    for name, content in payload.items():
-        target = token_dir / name
-        target.write_text(json.dumps(content), encoding="utf-8")
-        target.chmod(0o600)
-        print(f"  {name}: {target.stat().st_size} Bytes geschrieben")
-    return token_dir
+    def activities(self, start: date, end: date) -> list[dict]:
+        """Alle Aktivitaeten im Zeitraum, seitenweise."""
+        items, offset, page = [], 0, 100
+        while True:
+            resp = self.session.get(
+                self.BASE + "/activitylist-service/activities/search/activities",
+                params={"startDate": start.isoformat(), "endDate": end.isoformat(),
+                        "start": offset, "limit": page},
+                timeout=60)
+            resp.raise_for_status()
+            batch = resp.json() or []
+            items.extend(batch)
+            if len(batch) < page:
+                return items
+            offset += page
 
+    def download_fit_zip(self, activity_id: str) -> bytes:
+        resp = self.session.get(
+            f"{self.BASE}/download-service/files/activity/{activity_id}", timeout=120,
+            headers={"Accept": "application/zip, application/x-zip-compressed, "
+                               "application/octet-stream"})
+        resp.raise_for_status()
+        return resp.content
+
+
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Garmin-Aktivitaeten nach Drive")
@@ -493,26 +517,7 @@ def main() -> None:
     end = date.today()
     print(f"Zeitraum: {start} bis {end}")
 
-    token_dir = restore_tokens()
-    found = sorted(p.name for p in token_dir.glob("*")) if token_dir.is_dir() else []
-    print(f"Token-Ordner {token_dir}: {found or 'LEER'}")
-    if not found:
-        sys.exit("Keine Garmin-Tokens gefunden — Secret GARMIN_TOKENS pruefen.")
-
-    api = Garmin()
-    try:
-        api.login(str(token_dir))
-    except Exception as error:  # noqa: BLE001
-        sys.exit(
-            f"Garmin-Login fehlgeschlagen: {error}\n"
-            "Wenn die Tokendateien oben mit plausibler Groesse geschrieben wurden, "
-            "liegt es nicht am Secret: Garmin sitzt hinter Cloudflare und weist "
-            "Anfragen aus Rechenzentren ab. Ein leerer Antwortkoerper aeussert sich "
-            "als JSON-Fehler. Dieses Skript braucht eine Wohnadresse im Netz - "
-            "lokal oder auf einem Geraet zu Hause ausfuehren.\n"
-            "WICHTIG: nicht wiederholt neu starten. Mehrere Fehlversuche loesen "
-            "eine kontobezogene Sperre aus, die 24 bis 48 Stunden anhaelt."
-        )
+    api = GarminPersonal()
 
     drive = Drive(folder_id)
 
@@ -526,7 +531,7 @@ def main() -> None:
     else:
         print("--force: alle Einheiten im Zeitraum werden neu eingelesen")
 
-    listed = api.get_activities_by_date(start.isoformat(), end.isoformat())
+    listed = api.activities(start, end)
     print(f"{len(listed)} Aktivitaeten im Zeitraum, {len(known)} davon bereits erfasst")
 
     activities, laps, sets = [], [], []
@@ -535,11 +540,10 @@ def main() -> None:
         if activity_id in known:
             continue
         name = item.get("activityName") or ""
-        print(f"  lade {activity_id} — {name}")
+        # Im Repo sind die Action-Logs oeffentlich: dort keine Namen (Ort, Art) ausgeben.
+        print(f"  lade {activity_id}" + ("" if os.environ.get("GITHUB_ACTIONS") else f" — {name}"))
         try:
-            blob = api.download_activity(
-                activity_id, dl_fmt=api.ActivityDownloadFormat.ORIGINAL
-            )
+            blob = api.download_fit_zip(activity_id)
             with zipfile.ZipFile(io.BytesIO(blob)) as archive:
                 fit_names = [n for n in archive.namelist() if n.lower().endswith(".fit")]
                 if not fit_names:
