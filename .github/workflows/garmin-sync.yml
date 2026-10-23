@@ -1,10 +1,13 @@
 name: Garmin Sync
 
+# Seit 23.10.2026 ueber die offizielle Garmin Connect Personal API.
+# Kein Garmin-Login mehr, kein Sperrrisiko: der Key wird bei jedem Lauf
+# gegen einen 24-h-Token getauscht. Key gueltig bis 21.10.2027.
+
 on:
   schedule:
-    # 05:25 UTC = 07:25 Sommerzeit / 06:25 Winterzeit.
-    # Nach dem Whoop-Lauf, damit beide Quellen morgens frisch sind.
-    - cron: "25 5 * * *"
+    - cron: "17 4 * * *"    # 06:17 Sommerzeit / 05:17 Winterzeit
+    - cron: "47 19 * * *"   # 21:47 Sommerzeit / 20:47 Winterzeit
   workflow_dispatch:
     inputs:
       since:
@@ -12,17 +15,21 @@ on:
         required: false
         default: ""
 
+concurrency:
+  group: garmin-sync
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
 
       - name: Abhaengigkeiten installieren
@@ -30,12 +37,13 @@ jobs:
 
       - name: Synchronisieren
         env:
-          GARMIN_TOKENS_JSON: ${{ secrets.GARMIN_TOKENS_JSON }}
+          GARMIN_PERSONAL_API_KEY: ${{ secrets.GARMIN_PERSONAL_API_KEY }}
           GOOGLE_OAUTH_TOKEN: ${{ secrets.GOOGLE_OAUTH_TOKEN }}
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          SINCE: ${{ github.event.inputs.since }}
         run: |
-          if [ -n "${{ github.event.inputs.since }}" ]; then
-            python garmin_sync.py --since "${{ github.event.inputs.since }}"
+          if [ -n "$SINCE" ]; then
+            python garmin_sync.py --since "$SINCE"
           else
             python garmin_sync.py --days 14
           fi
