@@ -10,6 +10,8 @@ Drive-Ordner "Health".
     garmin_activities_<jahr>.csv   eine Zeile pro Einheit
     garmin_laps_<jahr>.csv         eine Zeile pro Runde
     garmin_strength_sets.csv       eine Zeile pro Satz
+    garmin_daily_<jahr>.csv        eine Zeile pro Tag: Schlaf, HRV, Body Battery,
+                                   Ruhepuls, Stress, Schritte, VO2max, Fitnessalter
     fit/<id>.fit                   Originaldatei, unveraendert
 
 Umgebung:
@@ -489,6 +491,16 @@ class GarminPersonal:
                 return items
             offset += page
 
+    def get(self, path: str, params: dict | None = None):
+        """JSON einer Abfrage, oder None, wenn Garmin nichts liefert."""
+        resp = self.session.get(self.BASE + path, params=params, timeout=60)
+        if resp.status_code != 200 or not resp.content:
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            return None
+
     def download_fit_zip(self, activity_id: str) -> bytes:
         resp = self.session.get(
             f"{self.BASE}/download-service/files/activity/{activity_id}", timeout=120,
@@ -499,6 +511,151 @@ class GarminPersonal:
 
 
 # ---------------------------------------------------------------------------
+# Tageswerte (Schlaf, HRV, Body Battery, Stress, VO2max ...)
+# ---------------------------------------------------------------------------
+
+DAILY_FIELDS = [
+    "date",
+    "sleep_h", "sleep_deep_h", "sleep_light_h", "sleep_rem_h", "sleep_awake_h",
+    "sleep_score", "sleep_need_h", "sleep_hr_avg", "sleep_stress_avg",
+    "sleep_resp_avg", "sleep_spo2_avg", "sleep_spo2_low",
+    "hrv_last_night", "hrv_weekly_avg", "hrv_5min_high", "hrv_status",
+    "hrv_balanced_low", "hrv_balanced_high",
+    "resting_hr", "hr_min", "hr_max",
+    "bb_max", "bb_min", "bb_charged", "bb_drained",
+    "stress_avg", "stress_max", "steps", "kcal_total", "kcal_active",
+    "intensity_moderate_min", "intensity_vigorous_min",
+    "day_resp_avg", "day_spo2_avg",
+    "vo2max_running", "vo2max_cycling", "fitness_age",
+]
+
+
+def dig(obj, *keys):
+    """Verschachtelten Wert holen, None statt Fehler."""
+    for key in keys:
+        if not isinstance(obj, dict):
+            return None
+        obj = obj.get(key)
+    return obj
+
+
+def hours(seconds):
+    return None if seconds is None else round(seconds / 3600, 2)
+
+
+def as_list(value):
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def daily_rows(api: "GarminPersonal", start: date, end: date) -> list[dict]:
+    rows: dict[str, dict] = {}
+
+    def row(day: str) -> dict:
+        return rows.setdefault(day, {"date": day})
+
+    window = timedelta(days=6)
+    cursor = start
+    while cursor <= end:
+        stop = min(cursor + window, end)
+        a, b = cursor.isoformat(), stop.isoformat()
+
+        for s in as_list(api.get("/sleep-service/sleep/dailySleepSummariesByDate",
+                                 {"startDate": a, "endDate": b})):
+            day = s.get("calendarDate")
+            if not day or not s.get("sleepTimeSeconds"):
+                continue
+            row(day).update({
+                "sleep_h": hours(s.get("sleepTimeSeconds")),
+                "sleep_deep_h": hours(s.get("deepSleepSeconds")),
+                "sleep_light_h": hours(s.get("lightSleepSeconds")),
+                "sleep_rem_h": hours(s.get("remSleepSeconds")),
+                "sleep_awake_h": hours(s.get("awakeSleepSeconds")),
+                "sleep_score": dig(s, "sleepScores", "overall", "value"),
+                "sleep_need_h": (None if dig(s, "sleepNeed", "actual") is None
+                                 else round(dig(s, "sleepNeed", "actual") / 60, 2)),
+                "sleep_hr_avg": s.get("avgHeartRate"),
+                "sleep_stress_avg": s.get("avgSleepStress"),
+                "sleep_resp_avg": s.get("averageRespirationValue"),
+                "sleep_spo2_avg": s.get("averageSpO2Value"),
+                "sleep_spo2_low": s.get("lowestSpO2Value"),
+            })
+
+        hrv = api.get(f"/hrv-service/hrv/daily/{a}/{b}") or {}
+        for h in as_list(hrv.get("hrvSummaries") if isinstance(hrv, dict) else hrv):
+            day = h.get("calendarDate")
+            if not day:
+                continue
+            row(day).update({
+                "hrv_last_night": h.get("lastNightAvg"),
+                "hrv_weekly_avg": h.get("weeklyAvg"),
+                "hrv_5min_high": h.get("lastNight5MinHigh"),
+                "hrv_status": h.get("status"),
+                "hrv_balanced_low": dig(h, "baseline", "balancedLow"),
+                "hrv_balanced_high": dig(h, "baseline", "balancedUpper"),
+            })
+
+        summary = api.get("/usersummary-service/v2/dailysummaries",
+                          {"startDate": a, "endDate": b}) or {}
+        for d in as_list(summary.get("data") if isinstance(summary, dict) else summary):
+            day = d.get("calendarDate")
+            if not day:
+                continue
+            row(day).update({
+                "resting_hr": dig(d, "heartRate", "restingValue"),
+                "hr_min": dig(d, "heartRate", "minValue"),
+                "hr_max": dig(d, "heartRate", "maxValue"),
+                "bb_max": dig(d, "bodyBattery", "maxValue"),
+                "bb_min": dig(d, "bodyBattery", "minValue"),
+                "bb_charged": dig(d, "bodyBattery", "chargedValue"),
+                "bb_drained": dig(d, "bodyBattery", "drainedValue"),
+                "stress_avg": dig(d, "stress", "avgLevel"),
+                "stress_max": dig(d, "stress", "maxLevel"),
+                "steps": dig(d, "movement", "steps", "value"),
+                "kcal_total": dig(d, "calories", "burnedTotal"),
+                "kcal_active": dig(d, "calories", "burnedActive"),
+                "intensity_moderate_min": dig(d, "intensityMinutes", "moderate"),
+                "intensity_vigorous_min": dig(d, "intensityMinutes", "vigorous"),
+                "day_resp_avg": dig(d, "respiration", "avgValue"),
+                "day_spo2_avg": dig(d, "pulseOx", "avgValue"),
+            })
+
+        # VO2max: "generic" ist bei Garmin der Laufwert, "cycling" der Radwert.
+        for v in as_list(api.get(f"/metrics-service/metrics/maxmet/daily/{a}/{b}")):
+            if not isinstance(v, dict):
+                continue
+            for key, column in (("generic", "vo2max_running"), ("cycling", "vo2max_cycling")):
+                entry = v.get(key)
+                if isinstance(entry, dict) and entry.get("calendarDate"):
+                    value = entry.get("vo2MaxPreciseValue") or entry.get("vo2MaxValue")
+                    row(entry["calendarDate"])[column] = value
+
+        cursor = stop + timedelta(days=1)
+
+    age = api.get(f"/fitnessage-service/fitnessage/v2/{end.isoformat()}")
+    if isinstance(age, dict) and age.get("fitnessAge") is not None:
+        row(end.isoformat())["fitness_age"] = round(age["fitnessAge"], 1)
+
+    return [rows[k] for k in sorted(rows)]
+
+
+def sync_daily(api: "GarminPersonal", drive: Drive, start: date, end: date) -> None:
+    try:
+        rows = daily_rows(api, start, end)
+    except Exception as error:  # noqa: BLE001
+        print(f"Tageswerte: Fehler beim Abruf ({type(error).__name__}), uebersprungen")
+        return
+    by_year: dict[str, list] = {}
+    for r in rows:
+        by_year.setdefault(r["date"][:4], []).append(r)
+    for year, items in sorted(by_year.items()):
+        count = merge_csv(drive, f"garmin_daily_{year}.csv", DAILY_FIELDS,
+                          items, lambda r: r["date"])
+        print(f"garmin_daily_{year}.csv  ({len(items)} Tage, +{count} neu)")
+
+
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Garmin-Aktivitaeten nach Drive")
@@ -506,6 +663,8 @@ def main() -> None:
     parser.add_argument("--since", help="Startdatum YYYY-MM-DD")
     parser.add_argument("--force", action="store_true",
                         help="Bereits erfasste Einheiten neu einlesen und ueberschreiben")
+    parser.add_argument("--no-daily", action="store_true",
+                        help="Tageswerte (Schlaf, HRV, Body Battery ...) nicht abrufen")
     args = parser.parse_args()
 
     folder_id = os.environ.get("DRIVE_FOLDER_ID", "")
@@ -520,6 +679,11 @@ def main() -> None:
     api = GarminPersonal()
 
     drive = Drive(folder_id)
+
+    # Tageswerte zuerst: sie aendern sich, bis der Tag vorbei ist, und werden
+    # deshalb bei jedem Lauf fuer den ganzen Zeitraum neu geschrieben.
+    if not args.no_daily:
+        sync_daily(api, drive, start, end)
 
     # Bereits verarbeitete Einheiten aus den vorhandenen CSVs lesen.
     known = set()
