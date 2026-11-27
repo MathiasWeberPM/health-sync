@@ -9,7 +9,10 @@ Drive-Ordner "Health".
 
     garmin_activities_<jahr>.csv   eine Zeile pro Einheit
     garmin_laps_<jahr>.csv         eine Zeile pro Runde
-    garmin_strength_sets.csv       eine Zeile pro Satz
+    garmin_strength_sets.csv       eine Zeile pro Satz. Uebung, Wiederholungen und
+                                   Gewicht kommen aus Garmin Connect (so wie in der
+                                   App, inkl. nachtraeglicher Korrekturen); nur wenn
+                                   das nicht geht, aus der FIT-Datei.
     garmin_daily_<jahr>.csv        eine Zeile pro Tag: Schlaf, HRV, Body Battery,
                                    Ruhepuls, Stress, Schritte, VO2max, Fitnessalter
     fit/<id>.fit                   Originaldatei, unveraendert
@@ -97,7 +100,13 @@ LAP_FIELDS = [
 SET_FIELDS = [
     "date", "activity_id", "start", "set_no", "exercise_guess", "alt_guesses",
     "repetitions", "weight_kg", "duration_s", "rest_after_s",
+    # seit 27.11.2026: genaue Uebung aus Garmin Connect
+    "exercise_code", "category_code", "source",
 ]
+
+# Wie viele Tage zurueck Kraft-Einheiten bei jedem Lauf neu aus Garmin Connect
+# gelesen werden, damit Korrekturen in der App (Gewicht, Uebung) ankommen.
+STRENGTH_REFRESH_DAYS = 14
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +426,129 @@ def parse_fit(blob: bytes, activity_id: str, name: str):
 
 
 # ---------------------------------------------------------------------------
+# Kraftsaetze aus Garmin Connect
+# ---------------------------------------------------------------------------
+
+def pretty(code) -> str:
+    """DUMBBELL_SPLIT_SQUAT -> Dumbbell Split Squat"""
+    if not code or not isinstance(code, str):
+        return ""
+    return code.replace("_", " ").title()
+
+
+def parse_gmt(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "").split(".")[0])
+    except ValueError:
+        return None
+
+
+def is_strength(item: dict) -> bool:
+    type_key = (item.get("activityType") or {}).get("typeKey", "")
+    return "strength" in type_key or type_key in ("hiit", "indoor_cardio")
+
+
+def utc_offset(item: dict) -> timedelta:
+    local = parse_gmt(item.get("startTimeLocal"))
+    gmt = parse_gmt(item.get("startTimeGMT"))
+    return (local - gmt) if local and gmt else timedelta(0)
+
+
+def sets_from_connect(raw: list, activity_id: str, offset: timedelta) -> list[dict]:
+    rows, set_no = [], 0
+    for index, entry in enumerate(raw):
+        if str(entry.get("setType", "")).upper() != "ACTIVE":
+            continue
+        set_no += 1
+        exercises = sorted(entry.get("exercises") or [],
+                           key=lambda e: -(e.get("probability") or 0))
+        main_ex = exercises[0] if exercises else {}
+        rest = None
+        if index + 1 < len(raw) and str(raw[index + 1].get("setType", "")).upper() == "REST":
+            rest = raw[index + 1].get("duration")
+        start = parse_gmt(entry.get("startTime"))
+        local = start + offset if start else None
+        weight = entry.get("weight")
+        if isinstance(weight, (int, float)) and weight > 0:
+            weight = weight / 1000 if weight > 500 else weight  # Garmin: Gramm
+        else:
+            weight = None
+        name = main_ex.get("name") or main_ex.get("category")
+        rows.append({
+            "date": local.date().isoformat() if local else "",
+            "activity_id": activity_id,
+            "start": local.strftime("%H:%M:%S") if local else "",
+            "set_no": set_no,
+            "exercise_guess": pretty(name),
+            "alt_guesses": " / ".join(pretty(e.get("name") or e.get("category"))
+                                      for e in exercises[1:]),
+            "repetitions": entry.get("repetitionCount"),
+            "weight_kg": rnd(weight, 2) if weight else "",
+            "duration_s": rnd(entry.get("duration"), 0),
+            "rest_after_s": rnd(rest, 0),
+            "exercise_code": main_ex.get("name") or "",
+            "category_code": main_ex.get("category") or "",
+            "source": "connect",
+        })
+    return rows
+
+
+def replace_activity_rows(drive: Drive, name: str, fields: list, rows: list,
+                          activity_ids: set) -> None:
+    """Saetze der genannten Einheiten komplett ersetzen (geloeschte Saetze
+    in der App verschwinden so auch aus der CSV)."""
+    text = drive.read_text(name)
+    kept = []
+    if text:
+        kept = [r for r in csv.DictReader(io.StringIO(text))
+                if str(r.get("activity_id")) not in activity_ids]
+    every = kept + rows
+    every.sort(key=lambda r: (str(r.get("date")), str(r.get("activity_id")),
+                              int(r.get("set_no") or 0)))
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore",
+                            lineterminator="\n")
+    writer.writeheader()
+    for r in every:
+        writer.writerow({k: ("" if v is None else v) for k, v in r.items()})
+    drive.write(name, buffer.getvalue().encode("utf-8"), "text/csv")
+
+
+def refresh_strength(api: "GarminPersonal", drive: Drive, listed: list,
+                     fit_sets: list) -> None:
+    """Kraft-Einheiten der letzten Tage neu aus Garmin Connect lesen. Fuer
+    Einheiten, bei denen das nicht klappt, bleiben die FIT-Saetze."""
+    cutoff = date.today() - timedelta(days=STRENGTH_REFRESH_DAYS)
+    rows, ids, from_connect = [], set(), 0
+    for item in listed:
+        if not is_strength(item):
+            continue
+        local = parse_gmt(item.get("startTimeLocal"))
+        if local and local.date() < cutoff:
+            continue
+        activity_id = str(item.get("activityId"))
+        try:
+            raw = api.exercise_sets(activity_id)
+        except Exception:  # noqa: BLE001
+            raw = None
+        if raw:
+            rows.extend(sets_from_connect(raw, activity_id, utc_offset(item)))
+            ids.add(activity_id)
+            from_connect += 1
+    fallback = [r for r in fit_sets if str(r["activity_id"]) not in ids]
+    for r in fallback:
+        r["source"] = "fit"
+    if not rows and not fallback:
+        return
+    replace_activity_rows(drive, "garmin_strength_sets.csv", SET_FIELDS,
+                          rows + fallback, ids | {str(r["activity_id"]) for r in fallback})
+    print(f"garmin_strength_sets.csv  ({from_connect} Einheiten aus Garmin Connect, "
+          f"{len({r['activity_id'] for r in fallback})} aus FIT)")
+
+
+# ---------------------------------------------------------------------------
 # CSV
 # ---------------------------------------------------------------------------
 
@@ -441,7 +573,11 @@ def merge_csv(drive: Drive, name: str, fields: list, rows: list, key) -> int:
     writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore",
                             lineterminator="\n")
     writer.writeheader()
-    for identifier in sorted(existing, key=str):
+    try:
+        order = sorted(existing)
+    except TypeError:
+        order = sorted(existing, key=str)
+    for identifier in order:
         writer.writerow(existing[identifier])
     drive.write(name, buffer.getvalue().encode("utf-8"), "text/csv")
     return added
@@ -500,6 +636,13 @@ class GarminPersonal:
             return resp.json()
         except ValueError:
             return None
+
+    def exercise_sets(self, activity_id: str):
+        """Saetze so, wie Garmin Connect sie anzeigt (inkl. Korrekturen)."""
+        data = self.get(f"/activity-service/activity/{activity_id}/exerciseSets")
+        if isinstance(data, dict):
+            data = data.get("exerciseSets")
+        return data if isinstance(data, list) and data else None
 
     def download_fit_zip(self, activity_id: str) -> bytes:
         resp = self.session.get(
@@ -733,8 +876,11 @@ def main() -> None:
         except Exception as error:  # noqa: BLE001
             print(f"    Archiv-Upload fehlgeschlagen: {error}")
 
+    # Kraftsaetze: neue Einheiten und Korrekturen der letzten Tage.
+    refresh_strength(api, drive, listed, sets)
+
     if not activities:
-        print("Nichts Neues.")
+        print("Keine neuen Einheiten.")
         return
 
     by_year: dict[str, list] = {}
@@ -752,11 +898,6 @@ def main() -> None:
         count = merge_csv(drive, f"garmin_laps_{year}.csv", LAP_FIELDS, rows,
                           lambda r: (str(r["activity_id"]), int(r["lap_no"])))
         print(f"garmin_laps_{year}.csv  (+{count})")
-
-    if sets:
-        count = merge_csv(drive, "garmin_strength_sets.csv", SET_FIELDS, sets,
-                          lambda r: (str(r["activity_id"]), int(r["set_no"])))
-        print(f"garmin_strength_sets.csv  (+{count})")
 
     print(f"Fertig: {len(activities)} neue Einheiten.")
 
