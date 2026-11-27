@@ -2,6 +2,7 @@
 # garminconnect/garth werden nicht mehr gebraucht.
 requests>=2.31
 fitparse==1.2.0
+garmin-fit-sdk==21.222.0   # offizielles Garmin-FIT-Profil: genaue Uebungsnamen
 google-api-python-client>=2.120.0
 google-auth>=2.28.0
 google-auth-oauthlib>=1.2.0
