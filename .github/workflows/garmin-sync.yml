@@ -6,7 +6,7 @@ name: Garmin Sync
 
 on:
   schedule:
-    - cron: "17 4 * * *"    # 06:17 Sommerzeit / 05:17 Winterzeit
+    - cron: "17 8 * * *"    # 09:17 Sommerzeit / 08:17 Winterzeit
     - cron: "47 19 * * *"   # 21:47 Sommerzeit / 20:47 Winterzeit
   workflow_dispatch:
     inputs:
