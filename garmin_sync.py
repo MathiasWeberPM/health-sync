@@ -521,7 +521,7 @@ def refresh_strength(api: "GarminPersonal", drive: Drive, listed: list,
     """Kraft-Einheiten der letzten Tage neu aus Garmin Connect lesen. Fuer
     Einheiten, bei denen das nicht klappt, bleiben die FIT-Saetze."""
     cutoff = date.today() - timedelta(days=STRENGTH_REFRESH_DAYS)
-    rows, ids, from_connect = [], set(), 0
+    rows, ids, from_connect, checked, failures = [], set(), 0, 0, []
     for item in listed:
         if not is_strength(item):
             continue
@@ -529,14 +529,21 @@ def refresh_strength(api: "GarminPersonal", drive: Drive, listed: list,
         if local and local.date() < cutoff:
             continue
         activity_id = str(item.get("activityId"))
+        checked += 1
         try:
-            raw = api.exercise_sets(activity_id)
-        except Exception:  # noqa: BLE001
-            raw = None
+            raw, status = api.exercise_sets(activity_id)
+        except Exception as error:  # noqa: BLE001
+            raw, status = None, type(error).__name__
+        if not raw:
+            failures.append(status)
         if raw:
             rows.extend(sets_from_connect(raw, activity_id, utc_offset(item)))
             ids.add(activity_id)
             from_connect += 1
+    # Nur Zaehler und Statuscodes ausgeben, keine Uebungen oder Werte.
+    print(f"Kraftsaetze: {checked} Kraft-Einheiten in den letzten "
+          f"{STRENGTH_REFRESH_DAYS} Tagen, {from_connect} aus Garmin Connect gelesen"
+          + (f", nicht lesbar: {', '.join(sorted(set(failures)))}" if failures else ""))
     fallback = [r for r in fit_sets if str(r["activity_id"]) not in ids]
     for r in fallback:
         r["source"] = "fit"
@@ -638,11 +645,22 @@ class GarminPersonal:
             return None
 
     def exercise_sets(self, activity_id: str):
-        """Saetze so, wie Garmin Connect sie anzeigt (inkl. Korrekturen)."""
-        data = self.get(f"/activity-service/activity/{activity_id}/exerciseSets")
+        """Saetze so, wie Garmin Connect sie anzeigt (inkl. Korrekturen).
+        Gibt (saetze | None, status) zurueck; status nur fuers Protokoll."""
+        resp = self.session.get(
+            f"{self.BASE}/activity-service/activity/{activity_id}/exerciseSets",
+            timeout=60)
+        if resp.status_code != 200 or not resp.content:
+            return None, f"HTTP {resp.status_code}"
+        try:
+            data = resp.json()
+        except ValueError:
+            return None, "keine JSON-Antwort"
         if isinstance(data, dict):
             data = data.get("exerciseSets")
-        return data if isinstance(data, list) and data else None
+        if not isinstance(data, list) or not data:
+            return None, "leer"
+        return data, "ok"
 
     def download_fit_zip(self, activity_id: str) -> bytes:
         resp = self.session.get(
